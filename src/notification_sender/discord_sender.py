@@ -6,6 +6,7 @@ Discord 发送提醒服务
 1. 通过 webhook 或 Discord bot API 发送 Discord 消息
 """
 import logging
+import os
 import time
 from typing import Optional
 
@@ -72,6 +73,17 @@ class DiscordSender:
             是否发送成功
         """
         sanitized_content = strip_hidden_markdown_metadata(content).strip()
+        # 繁體中文輸出：預設把簡體轉成台灣正體（含台灣慣用詞），REPORT_ZH_VARIANT=cn 可關閉
+        if sanitized_content and os.getenv("REPORT_ZH_VARIANT", "tw").strip().lower() not in ("cn", "zh-cn", "off", "none", "false", "0"):
+            try:
+                from opencc import OpenCC
+                try:
+                    _cc = OpenCC("s2twp")
+                except Exception:
+                    _cc = OpenCC("s2twp.json")
+                sanitized_content = _cc.convert(sanitized_content)
+            except Exception as exc:
+                logger.warning("繁體轉換失敗，改送原文: %s", exc)
         if not sanitized_content:
             logger.warning("Discord 消息内容为空，跳过推送")
             return False
