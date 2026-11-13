@@ -1,0 +1,98 @@
+name: 台股市場寬度
+
+on:
+  schedule:
+    # 台灣時間週一到週五 16:35、20:35（UTC 08:35、12:35）；同一天只會推送一次（已處理的日期會跳過）
+    - cron: '35 8 * * 1-5'
+    - cron: '35 12 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'daily = 每日增量；bootstrap = 一次性建檔（約 2 小時，需要 FINMIND_API_TOKEN）'
+        required: true
+        default: daily
+        type: choice
+        options: [daily, bootstrap]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tw-breadth
+  cancel-in-progress: false
+
+env:
+  DATA_BRANCH: tw-breadth-data
+  TRADERMONTY_SHA: 4251eaaeb05d720f5ffe8e899e3b6ec1cf48e96f  # 已審查的原版評分程式版本
+
+jobs:
+  breadth:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: 檢出程式碼
+        uses: actions/checkout@v5
+
+      - name: 設定 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: 安裝套件（固定版本）
+        run: pip install pandas==2.2.3 numpy==2.1.3 scipy==1.14.1 requests==2.32.3
+
+      - name: 取得原版評分程式（固定 commit）
+        run: |
+          git init -q tradermonty
+          cd tradermonty
+          git remote add origin https://github.com/tradermonty/claude-trading-skills.git
+          git sparse-checkout set skills/market-breadth-analyzer
+          git fetch -q --depth 1 origin "$TRADERMONTY_SHA"
+          git checkout -q FETCH_HEAD
+          test -f skills/market-breadth-analyzer/scripts/market_breadth_analyzer.py
+
+      - name: 取得資料分支
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git ls-remote --exit-code --heads "$REMOTE" "$DATA_BRANCH" >/dev/null; then
+            git clone -q --depth 1 --branch "$DATA_BRANCH" "$REMOTE" databranch
+          else
+            mkdir databranch && cd databranch
+            git init -q -b "$DATA_BRANCH"
+            git remote add origin "$REMOTE"
+          fi
+
+      - name: 一次性建檔（FinMind）
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'bootstrap'
+        env:
+          FINMIND_API_TOKEN: ${{ secrets.FINMIND_API_TOKEN }}
+          FINMIND_PRICE_DATASET: ${{ vars.FINMIND_PRICE_DATASET || 'TaiwanStockPrice' }}
+        run: python tw_breadth/breadth.py --state databranch/state bootstrap
+
+      - name: 每日增量（證交所）
+        id: update
+        if: github.event_name == 'schedule' || inputs.mode == 'daily'
+        run: python tw_breadth/breadth.py --state databranch/state update
+
+      - name: 評分並推送 Discord
+        if: inputs.mode == 'bootstrap' || steps.update.outputs.new_days != '0'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python tw_breadth/breadth.py --state databranch/state score \
+            --analyzer tradermonty/skills/market-breadth-analyzer --work work
+
+      - name: 儲存資料到資料分支
+        # 建檔就算推送失敗也要保存（避免重抓 2 小時）；每日增量只在全部成功時保存，失敗的話下一次排程會重做
+        if: always() && (inputs.mode == 'bootstrap' || success())
+        run: |
+          cd databranch
+          [ -d state ] || exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state
+          if git diff --cached --quiet; then echo "沒有變更"; exit 0; fi
+          git commit -q -m "tw-breadth: $(tail -n 1 state/breadth_history.csv | cut -d, -f1)"
+          git push -q origin "HEAD:${DATA_BRANCH}"
